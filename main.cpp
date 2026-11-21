@@ -683,8 +683,20 @@ static void run() {
     auto ev_primary = [&](const Ev& x) { return pk_sort_key(x.pk); };
     auto click_primary = [&](const Click& x) { return pk_sort_key(x.pk); };
     if (WS >= WEEK && WE < (1LL << 48)) {
-      radix_sort_pair(E, ev_primary, [](const Ev& x) { return x.ts; }, 55, 48, false);
-      radix_sort_pair(K, click_primary, [](const Click& x) { return x.ts; }, 55, 48, false);
+      // Rebase into compact nonnegative offsets. This keeps ordering intact
+      // while making the radix digit count depend on the actual data window.
+      u64 event_span = (u64)(WE - WS);
+      u64 click_span = (u64)(WE - WS + WEEK);
+      auto bits_for = [](u64 span) {
+        u64 mx = span > 0 ? span - 1 : 0;
+        return (unsigned)max(1, 64 - __builtin_clzll(mx ? mx : 1));
+      };
+      unsigned event_bits = bits_for(event_span);
+      unsigned click_bits = bits_for(click_span);
+      radix_sort_pair(E, ev_primary, [&](const Ev& x) { return (u64)(x.ts - WS); },
+                      55, event_bits, false);
+      radix_sort_pair(K, click_primary, [&](const Click& x) { return (u64)(x.ts - (WS - WEEK)); },
+                      55, click_bits, false);
     } else {
       radix_sort_pair(E, ev_primary, [](const Ev& x) { return x.ts; }, 55, 64, true);
       radix_sort_pair(K, click_primary, [](const Click& x) { return x.ts; }, 55, 64, true);
