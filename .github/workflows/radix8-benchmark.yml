@@ -1,0 +1,55 @@
+name: Validate radix8 trimmed-key candidate
+
+on:
+  push:
+    branches:
+      - "optimise/radix8-trim-v1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v4
+
+      - name: Download released test assets
+        run: |
+          mkdir -p /tmp/test-assets
+          curl -fL --retry 3 "https://github.com/olichen1/shopping-sessions-urbaners/releases/download/test-data-v1/generator.zip" -o /tmp/test-assets/generator.zip
+          curl -fL --retry 3 "https://github.com/olichen1/shopping-sessions-urbaners/releases/download/test-data-v1/dev-answer.zip" -o /tmp/test-assets/dev-answer.zip
+          unzip -q /tmp/test-assets/generator.zip -d /tmp/generator-src
+          unzip -q /tmp/test-assets/dev-answer.zip -d /tmp/expected
+
+      - name: Build generator and public dev data
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cargo rustc python3-pip unzip
+          cargo build --release --manifest-path /tmp/generator-src/generator/Cargo.toml
+          /tmp/generator-src/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev
+
+      - name: Build exact submission image
+        run: docker build --platform linux/amd64 -t shopping-sessions-candidate .
+
+      - name: Check exact public dev outputs
+        run: |
+          mkdir -p /tmp/output
+          docker run --rm --cpuset-cpus=0-1 -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=2 \
+            -v /tmp/dev:/data:ro -v /tmp/output:/output shopping-sessions-candidate
+          python3 -m pip install --break-system-packages duckdb
+          python3 check.py /tmp/output /tmp/expected/dev-answer
+
+      - name: Generate practice workload
+        run: |
+          /tmp/generator-src/generator/target/release/generate --seed 1 --events 20000000 --clicks 5000000 --output /tmp/practice
+
+      - name: Benchmark practice workload
+        run: |
+          mkdir -p /tmp/practice-output
+          /usr/bin/time -f 'PRACTICE_ELAPSED_SECONDS=%e MAX_RSS_KB=%M' docker run --rm \
+            --cpuset-cpus=0-1 -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=2 \
+            -v /tmp/practice:/data:ro -v /tmp/practice-output:/output shopping-sessions-candidate
