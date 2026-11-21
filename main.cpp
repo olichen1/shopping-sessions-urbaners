@@ -262,7 +262,7 @@ struct Click { u64 pk; i64 ts; u64 cid; u32 camp; u32 pad; };
  */
 // 8-bit stable LSD radix passes, with redundant key bits omitted per
 // partition. Small histograms remain cache-resident on each worker.
-static constexpr unsigned RADIX_BITS = 8;
+static constexpr unsigned RADIX_BITS = 11;
 static constexpr size_t RADIX_SIZE = 1u << RADIX_BITS;
 static constexpr u64 RADIX_MASK = RADIX_SIZE - 1;
 
@@ -273,9 +273,9 @@ static void radix_sort_u64(vector<T>& a, Key key, unsigned bits = 64) {
     sort(a.begin(), a.end(), [&](const T& x, const T& y) { return key(x) < key(y); });
     return;
   }
-  vector<T> scratch(n);
+  unique_ptr<T[]> scratch(new T[n]);
   T* src = a.data();
-  T* dst = scratch.data();
+  T* dst = scratch.get();
   for (unsigned shift = 0; shift < bits; shift += RADIX_BITS) {
     size_t count[RADIX_SIZE] = {};
     for (size_t i = 0; i < n; ++i) ++count[(u64(key(src[i])) >> shift) & RADIX_MASK];
@@ -284,7 +284,7 @@ static void radix_sort_u64(vector<T>& a, Key key, unsigned bits = 64) {
     for (size_t i = 0; i < n; ++i) dst[count[(u64(key(src[i])) >> shift) & RADIX_MASK]++] = src[i];
     swap(src, dst);
   }
-  if (src != a.data()) a.swap(scratch);
+  if (src != a.data()) copy(src, src + n, a.data());
 }
 
 template <class T, class Primary, class Secondary>
@@ -300,9 +300,9 @@ static void radix_sort_pair(vector<T>& a, Primary primary, Secondary secondary,
     });
     return;
   }
-  vector<T> scratch(n);
+  unique_ptr<T[]> scratch(new T[n]);
   T* src = a.data();
-  T* dst = scratch.data();
+  T* dst = scratch.get();
   auto pass = [&](auto key, unsigned shift, bool bias) {
     size_t count[RADIX_SIZE] = {};
     for (size_t i = 0; i < n; ++i) {
@@ -323,7 +323,7 @@ static void radix_sort_pair(vector<T>& a, Primary primary, Secondary secondary,
     pass(secondary, shift, signed_secondary);
   for (unsigned shift = 0; shift < primary_bits; shift += RADIX_BITS)
     pass(primary, shift, false);
-  if (src != a.data()) a.swap(scratch);
+  if (src != a.data()) copy(src, src + n, a.data());
 }
 static const int P = 256, NB = 512;
 static inline size_t bucket_of(u64 pk) { return (pk >> 16) & (NB - 1); }
