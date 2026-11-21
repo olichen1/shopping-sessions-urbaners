@@ -260,29 +260,38 @@ struct Click { u64 pk; i64 ts; u64 cid; u32 camp; u32 pad; };
  * Pair sorting is LSD: secondary key first, then primary key. Signed secondary
  * keys are biased so their unsigned byte order matches signed integer order.
  */
+// 8-bit stable LSD radix passes, with redundant key bits omitted per
+// partition. Small histograms remain cache-resident on each worker.
+static constexpr unsigned RADIX_BITS = 8;
+static constexpr size_t RADIX_SIZE = 1u << RADIX_BITS;
+static constexpr u64 RADIX_MASK = RADIX_SIZE - 1;
+
 template <class T, class Key>
-static void radix_sort_u64(vector<T>& a, Key key) {
+static void radix_sort_u64(vector<T>& a, Key key, unsigned bits = 64) {
   const size_t n = a.size();
   if (n < 2048) {
     sort(a.begin(), a.end(), [&](const T& x, const T& y) { return key(x) < key(y); });
     return;
   }
-  unique_ptr<T[]> scratch(new T[n]);
+  vector<T> scratch(n);
   T* src = a.data();
-  T* dst = scratch.get();
-  for (int shift = 0; shift < 64; shift += 8) {
-    size_t count[256] = {};
-    for (size_t i = 0; i < n; ++i) ++count[(key(src[i]) >> shift) & 255];
+  T* dst = scratch.data();
+  for (unsigned shift = 0; shift < bits; shift += RADIX_BITS) {
+    size_t count[RADIX_SIZE] = {};
+    for (size_t i = 0; i < n; ++i) ++count[(u64(key(src[i])) >> shift) & RADIX_MASK];
     size_t sum = 0;
-    for (int b = 0; b < 256; ++b) { size_t c = count[b]; count[b] = sum; sum += c; }
-    for (size_t i = 0; i < n; ++i) dst[count[(key(src[i]) >> shift) & 255]++] = src[i];
+    for (size_t b = 0; b < RADIX_SIZE; ++b) { size_t c = count[b]; count[b] = sum; sum += c; }
+    for (size_t i = 0; i < n; ++i) dst[count[(u64(key(src[i])) >> shift) & RADIX_MASK]++] = src[i];
     swap(src, dst);
   }
-  if (src != a.data()) copy(src, src + n, a.data());
+  if (src != a.data()) a.swap(scratch);
 }
 
 template <class T, class Primary, class Secondary>
-static void radix_sort_pair(vector<T>& a, Primary primary, Secondary secondary) {
+static void radix_sort_pair(vector<T>& a, Primary primary, Secondary secondary,
+                            unsigned primary_bits = 64,
+                            unsigned secondary_bits = 64,
+                            bool signed_secondary = true) {
   const size_t n = a.size();
   if (n < 2048) {
     sort(a.begin(), a.end(), [&](const T& x, const T& y) {
@@ -291,22 +300,30 @@ static void radix_sort_pair(vector<T>& a, Primary primary, Secondary secondary) 
     });
     return;
   }
-  unique_ptr<T[]> scratch(new T[n]);
+  vector<T> scratch(n);
   T* src = a.data();
-  T* dst = scratch.get();
-  auto pass = [&](auto key, int shift) {
-    size_t count[256] = {};
-    for (size_t i = 0; i < n; ++i) ++count[(key(src[i]) >> shift) & 255];
+  T* dst = scratch.data();
+  auto pass = [&](auto key, unsigned shift, bool bias) {
+    size_t count[RADIX_SIZE] = {};
+    for (size_t i = 0; i < n; ++i) {
+      u64 v = (u64)key(src[i]);
+      if (bias) v ^= 0x8000000000000000ULL;
+      ++count[(v >> shift) & RADIX_MASK];
+    }
     size_t sum = 0;
-    for (int b = 0; b < 256; ++b) { size_t c = count[b]; count[b] = sum; sum += c; }
-    for (size_t i = 0; i < n; ++i) dst[count[(key(src[i]) >> shift) & 255]++] = src[i];
+    for (size_t b = 0; b < RADIX_SIZE; ++b) { size_t c = count[b]; count[b] = sum; sum += c; }
+    for (size_t i = 0; i < n; ++i) {
+      u64 v = (u64)key(src[i]);
+      if (bias) v ^= 0x8000000000000000ULL;
+      dst[count[(v >> shift) & RADIX_MASK]++] = src[i];
+    }
     swap(src, dst);
   };
-  for (int shift = 0; shift < 64; shift += 8)
-    pass([&](const T& x) { return (u64)secondary(x) ^ 0x8000000000000000ULL; }, shift);
-  for (int shift = 0; shift < 64; shift += 8)
-    pass([&](const T& x) { return (u64)primary(x); }, shift);
-  if (src != a.data()) copy(src, src + n, a.data());
+  for (unsigned shift = 0; shift < secondary_bits; shift += RADIX_BITS)
+    pass(secondary, shift, signed_secondary);
+  for (unsigned shift = 0; shift < primary_bits; shift += RADIX_BITS)
+    pass(primary, shift, false);
+  if (src != a.data()) a.swap(scratch);
 }
 static const int P = 256, NB = 512;
 static inline size_t bucket_of(u64 pk) { return (pk >> 16) & (NB - 1); }
@@ -562,7 +579,7 @@ static void run() {
       for (int tt = 0; tt < T; tt++) tot += parts[tt][p].size();
       v.reserve(tot);
       for (int tt = 0; tt < T; tt++) { v.insert(v.end(), parts[tt][p].begin(), parts[tt][p].end()); vector<Rec>().swap(parts[tt][p]); }
-      radix_sort_u64(v, [](const Rec& a) { return a.h; });
+      radix_sort_u64(v, [](const Rec& a) { return ((a.h >> 16) << 8) | (a.h & 0xff); }, 56);
       auto validate = [&](const Rec& r) {
         SV f[7];
         if (!parse_fields(r.p, r.p + r.len, 7, f)) return;
@@ -660,8 +677,18 @@ static void run() {
       E.insert(E.end(), evb[tt][b].begin(), evb[tt][b].end()); vector<Ev>().swap(evb[tt][b]);
       K.insert(K.end(), ckb[tt][b].begin(), ckb[tt][b].end()); vector<Click>().swap(ckb[tt][b]);
     }
-    radix_sort_pair(E, [](const Ev& a) { return a.pk; }, [](const Ev& a) { return a.ts; });
-    radix_sort_pair(K, [](const Click& a) { return a.pk; }, [](const Click& a) { return a.ts; });
+    // For a given bucket, pk bits 16..24 are constant. Removing them
+    // preserves pk ordering while reducing the primary key to 55 bits.
+    auto pk_sort_key = [](u64 pk) { return ((pk >> 25) << 16) | (pk & 0xffff); };
+    auto ev_primary = [&](const Ev& x) { return pk_sort_key(x.pk); };
+    auto click_primary = [&](const Click& x) { return pk_sort_key(x.pk); };
+    if (WS >= WEEK && WE < (1LL << 48)) {
+      radix_sort_pair(E, ev_primary, [](const Ev& x) { return x.ts; }, 55, 48, false);
+      radix_sort_pair(K, click_primary, [](const Click& x) { return x.ts; }, 55, 48, false);
+    } else {
+      radix_sort_pair(E, ev_primary, [](const Ev& x) { return x.ts; }, 55, 64, true);
+      radix_sort_pair(K, click_primary, [](const Click& x) { return x.ts; }, 55, 64, true);
+    }
     size_t i = 0, ki = 0;
     while (i < E.size()) {
       u64 pk = E[i].pk;
