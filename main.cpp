@@ -685,11 +685,11 @@ static void run() {
     if (WS >= WEEK && WE < (1LL << 48)) {
       // The window (including the seven-day click lookback) is nonnegative
       // and fits in 48 bits, so timestamps need only four radix digits.
-      radix_sort_pair(E, ev_primary, [](const Ev& x) { return (u64)x.ts; }, 55, 48, false);
-      radix_sort_pair(K, click_primary, [](const Click& x) { return (u64)x.ts; }, 55, 48, false);
+      radix_sort_pair(E, ev_primary, [](const Ev& x) { return x.ts; }, 55, 48, false);
+      radix_sort_pair(K, click_primary, [](const Click& x) { return x.ts; }, 55, 48, false);
     } else {
-      radix_sort_pair(E, ev_primary, [](const Ev& x) { return (u64)x.ts; }, 55, 64, true);
-      radix_sort_pair(K, click_primary, [](const Click& x) { return (u64)x.ts; }, 55, 64, true);
+      radix_sort_pair(E, ev_primary, [](const Ev& x) { return x.ts; }, 55, 64, true);
+      radix_sort_pair(K, click_primary, [](const Click& x) { return x.ts; }, 55, 64, true);
     }
     size_t i = 0, ki = 0;
     while (i < E.size()) {
