@@ -1,4 +1,4 @@
-name: Inspect released test assets
+name: Validate public dev dataset
 
 on:
   push:
@@ -12,37 +12,45 @@ permissions:
   contents: read
 
 jobs:
-  inspect:
+  validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - name: Download release assets
+      - name: Check out candidate
+        uses: actions/checkout@v4
+
+      - name: Download released test assets
         run: |
           mkdir -p /tmp/test-assets
           curl -fL --retry 3 "https://github.com/olichen1/shopping-sessions-urbaners/releases/download/test-data-v1/generator.zip" -o /tmp/test-assets/generator.zip
           curl -fL --retry 3 "https://github.com/olichen1/shopping-sessions-urbaners/releases/download/test-data-v1/dev-answer.zip" -o /tmp/test-assets/dev-answer.zip
-          ls -lh /tmp/test-assets
-      - name: Inspect archive contents and text instructions
-        run: |
-          python3 - <<'PY'
-          import zipfile
-          from pathlib import Path
+          unzip -q /tmp/test-assets/generator.zip -d /tmp/generator-src
+          unzip -q /tmp/test-assets/dev-answer.zip -d /tmp/expected
+          ls -lh /tmp/test-assets /tmp/expected/dev-answer
 
-          for archive in sorted(Path("/tmp/test-assets").glob("*.zip")):
-              print(f"\\n===== {archive.name} =====")
-              with zipfile.ZipFile(archive) as z:
-                  for info in z.infolist():
-                      print(f"{info.file_size:>12} bytes  {info.filename}")
-                  if archive.name == "generator.zip":
-                      for info in z.infolist():
-                          if info.is_dir() or info.file_size > 150_000:
-                              continue
-                          name = info.filename.lower()
-                          if name.endswith((".md", ".txt", ".rs", ".py", ".toml", ".sh", ".json", ".yaml", ".yml")):
-                              data = z.read(info.filename)
-                              try:
-                                  text = data.decode("utf-8")
-                              except UnicodeDecodeError:
-                                  continue
-                              print(f"\\n----- TEXT: {info.filename} -----")
-                              print(text[:30000])
-          PY
+      - name: Build the official public dev dataset
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cargo rustc python3-pip unzip
+          cargo --version
+          rustc --version
+          cargo build --release --manifest-path /tmp/generator-src/generator/Cargo.toml
+          /tmp/generator-src/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev
+          find /tmp/dev -maxdepth 2 -type f -printf '%p %s bytes\\n' | sort
+
+      - name: Build the exact submission Docker image
+        run: docker build --platform linux/amd64 -t shopping-sessions-candidate .
+
+      - name: Run candidate against generated dataset
+        run: |
+          mkdir -p /tmp/output
+          /usr/bin/time -v docker run --rm \
+            --cpuset-cpus=0-1 \
+            -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=2 \
+            -v /tmp/dev:/data:ro -v /tmp/output:/output \
+            shopping-sessions-candidate
+
+      - name: Compare Parquet outputs with dev answer
+        run: |
+          python3 -m pip install --break-system-packages duckdb
+          python3 check.py /tmp/output /tmp/expected/dev-answer
