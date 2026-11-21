@@ -1,5 +1,6 @@
 // Shopping Sessions: single-binary C++17 pipeline. See rules.md.
 #include <algorithm>
+#include <memory>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -253,6 +254,60 @@ struct Table {
 struct Rec { u64 h; i64 ing; const char* p; u32 len; u32 pad; };
 struct Ev { u64 pk; i64 ts; u64 nm; u32 price; u16 cat; u8 type; u8 pad; };
 struct Click { u64 pk; i64 ts; u64 cid; u32 camp; u32 pad; };
+
+/*
+ * Stable byte-radix sorts for the large fixed-width keys in this pipeline.
+ * Pair sorting is LSD: secondary key first, then primary key. Signed secondary
+ * keys are biased so their unsigned byte order matches signed integer order.
+ */
+template <class T, class Key>
+static void radix_sort_u64(vector<T>& a, Key key) {
+  const size_t n = a.size();
+  if (n < 2048) {
+    sort(a.begin(), a.end(), [&](const T& x, const T& y) { return key(x) < key(y); });
+    return;
+  }
+  unique_ptr<T[]> scratch(new T[n]);
+  T* src = a.data();
+  T* dst = scratch.get();
+  for (int shift = 0; shift < 64; shift += 8) {
+    size_t count[256] = {};
+    for (size_t i = 0; i < n; ++i) ++count[(key(src[i]) >> shift) & 255];
+    size_t sum = 0;
+    for (int b = 0; b < 256; ++b) { size_t c = count[b]; count[b] = sum; sum += c; }
+    for (size_t i = 0; i < n; ++i) dst[count[(key(src[i]) >> shift) & 255]++] = src[i];
+    swap(src, dst);
+  }
+  if (src != a.data()) copy(src, src + n, a.data());
+}
+
+template <class T, class Primary, class Secondary>
+static void radix_sort_pair(vector<T>& a, Primary primary, Secondary secondary) {
+  const size_t n = a.size();
+  if (n < 2048) {
+    sort(a.begin(), a.end(), [&](const T& x, const T& y) {
+      auto px = primary(x), py = primary(y);
+      return px != py ? px < py : secondary(x) < secondary(y);
+    });
+    return;
+  }
+  unique_ptr<T[]> scratch(new T[n]);
+  T* src = a.data();
+  T* dst = scratch.get();
+  auto pass = [&](auto key, int shift) {
+    size_t count[256] = {};
+    for (size_t i = 0; i < n; ++i) ++count[(key(src[i]) >> shift) & 255];
+    size_t sum = 0;
+    for (int b = 0; b < 256; ++b) { size_t c = count[b]; count[b] = sum; sum += c; }
+    for (size_t i = 0; i < n; ++i) dst[count[(key(src[i]) >> shift) & 255]++] = src[i];
+    swap(src, dst);
+  };
+  for (int shift = 0; shift < 64; shift += 8)
+    pass([&](const T& x) { return (u64)secondary(x) ^ 0x8000000000000000ULL; }, shift);
+  for (int shift = 0; shift < 64; shift += 8)
+    pass([&](const T& x) { return (u64)primary(x); }, shift);
+  if (src != a.data()) copy(src, src + n, a.data());
+}
 static const int P = 256, NB = 512;
 static inline size_t bucket_of(u64 pk) { return (pk >> 16) & (NB - 1); }
 static inline u64 pack_sv(SV s) { return (u64)(uintptr_t)s.p | ((u64)min<size_t>(s.n(), 65535) << 48); }
@@ -453,7 +508,7 @@ static void run() {
       ids.push_back({uid(l.a), l.a.p, (u32)l.a.n()});
       ids.push_back({uid(l.b), l.b.p, (u32)l.b.n()});
     }
-    sort(ids.begin(), ids.end(), [](const IdE& x, const IdE& y) { return x.h < y.h; });
+    radix_sort_u64(ids, [](const IdE& x) { return x.h; });
     ids.erase(unique(ids.begin(), ids.end(), [](const IdE& x, const IdE& y) { return x.h == y.h; }), ids.end());
     size_t M = ids.size();
     vector<u32> par(M);
@@ -507,7 +562,7 @@ static void run() {
       for (int tt = 0; tt < T; tt++) tot += parts[tt][p].size();
       v.reserve(tot);
       for (int tt = 0; tt < T; tt++) { v.insert(v.end(), parts[tt][p].begin(), parts[tt][p].end()); vector<Rec>().swap(parts[tt][p]); }
-      sort(v.begin(), v.end(), [](const Rec& a, const Rec& b) { return a.h != b.h ? a.h < b.h : a.ing < b.ing; });
+      radix_sort_u64(v, [](const Rec& a) { return a.h; });
       auto validate = [&](const Rec& r) {
         SV f[7];
         if (!parse_fields(r.p, r.p + r.len, 7, f)) return;
@@ -533,22 +588,30 @@ static void run() {
         u64 pk = en ? en->pk : key;
         evb[t][bucket_of(pk)].push_back(Ev{pk, ts, pack_sv(f[1]), price, cat, type, 0});
       };
+      struct BestCopy { SV id; Rec rec; };
+      vector<BestCopy> best;
+      best.reserve(4);
       size_t i = 0, n = v.size();
       while (i < n) {
         size_t j = i + 1;
         while (j < n && v[j].h == v[i].h) j++;
-        if (j - i == 1) validate(v[i]);
-        else {
-          vector<SV> seen;
+        if (j - i == 1) {
+          validate(v[i]);
+        } else {
+          // Hashes partition candidates only. Compare full event_id bytes and
+          // retain the smallest ingest_ts for each exact ID before validation.
+          best.clear();
           for (size_t k = i; k < j; k++) {
             SV f[7];
             if (!parse_fields(v[k].p, v[k].p + v[k].len, 7, f)) continue;
-            bool dup = false;
-            for (auto& s : seen) if (s.n() == f[0].n() && memcmp(s.p, f[0].p, s.n()) == 0) { dup = true; break; }
-            if (dup) continue;
-            seen.push_back(f[0]);
-            validate(v[k]);
+            size_t z = 0;
+            while (z < best.size() &&
+                   !(best[z].id.n() == f[0].n() &&
+                     memcmp(best[z].id.p, f[0].p, f[0].n()) == 0)) ++z;
+            if (z == best.size()) best.push_back({f[0], v[k]});
+            else if (v[k].ing < best[z].rec.ing) best[z].rec = v[k];
           }
+          for (const BestCopy& x : best) validate(x.rec);
         }
         i = j;
       }
@@ -597,8 +660,8 @@ static void run() {
       E.insert(E.end(), evb[tt][b].begin(), evb[tt][b].end()); vector<Ev>().swap(evb[tt][b]);
       K.insert(K.end(), ckb[tt][b].begin(), ckb[tt][b].end()); vector<Click>().swap(ckb[tt][b]);
     }
-    sort(E.begin(), E.end(), [](const Ev& a, const Ev& b) { return a.pk != b.pk ? a.pk < b.pk : a.ts < b.ts; });
-    sort(K.begin(), K.end(), [](const Click& a, const Click& b) { return a.pk != b.pk ? a.pk < b.pk : a.ts < b.ts; });
+    radix_sort_pair(E, [](const Ev& a) { return a.pk; }, [](const Ev& a) { return a.ts; });
+    radix_sort_pair(K, [](const Click& a) { return a.pk; }, [](const Click& a) { return a.ts; });
     size_t i = 0, ki = 0;
     while (i < E.size()) {
       u64 pk = E[i].pk;
