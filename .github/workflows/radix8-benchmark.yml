@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   validate:
@@ -47,9 +48,21 @@ jobs:
         run: |
           /tmp/generator-src/generator/target/release/generate --seed 1 --events 20000000 --clicks 5000000 --output /tmp/practice
 
-      - name: Benchmark practice workload
+      - name: Benchmark practice workload and capture stage timings
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p /tmp/practice-output
+          set -o pipefail
           /usr/bin/time -f 'PRACTICE_ELAPSED_SECONDS=%e MAX_RSS_KB=%M' docker run --rm \
             --cpuset-cpus=0-1 -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=2 \
-            -v /tmp/practice:/data:ro -v /tmp/practice-output:/output shopping-sessions-candidate
+            -v /tmp/practice:/data:ro -v /tmp/practice-output:/output shopping-sessions-candidate \
+            2>&1 | tee /tmp/practice-run.log
+          {
+            echo '### Candidate stage timings'
+            echo
+            echo '`'"${GITHUB_SHA:0:12}"'`'
+            grep -E '^\\[[[:space:]]*[0-9]+\\.[0-9]+s\\]' /tmp/practice-run.log || true
+            grep -E 'PRACTICE_ELAPSED_SECONDS|MAX_RSS_KB' /tmp/practice-run.log || true
+          } > /tmp/benchmark-comment.md
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/1/comments" -f body="$(cat /tmp/benchmark-comment.md)"
