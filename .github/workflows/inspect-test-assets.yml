@@ -1,0 +1,48 @@
+name: Inspect released test assets
+
+on:
+  push:
+    branches:
+      - "optimise/radix-sort-v1"
+    paths:
+      - ".github/workflows/inspect-test-assets.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        run: |
+          mkdir -p /tmp/test-assets
+          curl -fL --retry 3 "https://github.com/olichen1/shopping-sessions-urbaners/releases/download/test-data-v1/generator.zip" -o /tmp/test-assets/generator.zip
+          curl -fL --retry 3 "https://github.com/olichen1/shopping-sessions-urbaners/releases/download/test-data-v1/dev-answer.zip" -o /tmp/test-assets/dev-answer.zip
+          ls -lh /tmp/test-assets
+      - name: Inspect archive contents and text instructions
+        run: |
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+
+          for archive in sorted(Path("/tmp/test-assets").glob("*.zip")):
+              print(f"\\n===== {archive.name} =====")
+              with zipfile.ZipFile(archive) as z:
+                  for info in z.infolist():
+                      print(f"{info.file_size:>12} bytes  {info.filename}")
+                  if archive.name == "generator.zip":
+                      for info in z.infolist():
+                          if info.is_dir() or info.file_size > 150_000:
+                              continue
+                          name = info.filename.lower()
+                          if name.endswith((".md", ".txt", ".rs", ".py", ".toml", ".sh", ".json", ".yaml", ".yml")):
+                              data = z.read(info.filename)
+                              try:
+                                  text = data.decode("utf-8")
+                              except UnicodeDecodeError:
+                                  continue
+                              print(f"\\n----- TEXT: {info.filename} -----")
+                              print(text[:30000])
+          PY
