@@ -241,10 +241,35 @@ static inline i64 floordiv(i64 a, i64 b) { i64 q = a / b; if ((a % b != 0) && ((
 // ---------- id table ----------
 struct Ent { u64 key; u64 pk; const char* name; u32 nlen; u32 pad; };
 struct Table {
-  vector<Ent> t; u64 mask = 0;
-  void init(size_t n) { size_t c = 16; while (c < 2 * n + 16) c <<= 1; t.assign(c, Ent{0, 0, nullptr, 0, 0}); mask = c - 1; }
-  void put(const Ent& e) { size_t i = (e.key >> 1) & mask; while (t[i].key) i = (i + 1) & mask; t[i] = e; }
+  vector<Ent> t;
+  vector<u64> bloom;
+  u64 mask = 0, bloom_mask = 0;
+  void init(size_t n) {
+    size_t c = 16;
+    while (c < 2 * n + 16) c <<= 1;
+    t.assign(c, Ent{0, 0, nullptr, 0, 0});
+    mask = c - 1;
+    // Two-hash Bloom filter with 16 bits per linked ID. It cheaply rejects
+    // most ordinary (unlinked) user IDs before touching the larger hash table.
+    size_t bits = 64;
+    while (bits < n * 16) bits <<= 1;
+    bloom.assign(bits >> 6, 0);
+    bloom_mask = bits - 1;
+  }
+  void put(const Ent& e) {
+    u64 a = (e.key >> 1) & bloom_mask;
+    u64 b = (e.key >> 33) & bloom_mask;
+    bloom[a >> 6] |= 1ULL << (a & 63);
+    bloom[b >> 6] |= 1ULL << (b & 63);
+    size_t i = (e.key >> 1) & mask;
+    while (t[i].key) i = (i + 1) & mask;
+    t[i] = e;
+  }
   const Ent* find(u64 key) const {
+    u64 a = (key >> 1) & bloom_mask;
+    u64 b = (key >> 33) & bloom_mask;
+    if (!(bloom[a >> 6] & (1ULL << (a & 63))) ||
+        !(bloom[b >> 6] & (1ULL << (b & 63)))) return nullptr;
     size_t i = (key >> 1) & mask;
     for (;;) { const Ent& e = t[i]; if (e.key == key) return &e; if (!e.key) return nullptr; i = (i + 1) & mask; }
   }
