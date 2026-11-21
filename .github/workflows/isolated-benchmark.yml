@@ -1,0 +1,75 @@
+name: Isolated A-B-A performance comparison
+
+on:
+  push:
+    branches:
+      - "bench/isolated-runs-v1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out all benchmark revisions
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download test assets and install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cargo rustc python3-pip unzip
+          mkdir -p /tmp/test-assets
+          curl -fL --retry 3 "https://github.com/olichen1/shopping-sessions-urbaners/releases/download/test-data-v1/generator.zip" -o /tmp/test-assets/generator.zip
+          unzip -q /tmp/test-assets/generator.zip -d /tmp/generator-src
+          cargo build --release --manifest-path /tmp/generator-src/generator/Cargo.toml
+          /tmp/generator-src/generator/target/release/generate --seed 1 --events 20000000 --clicks 5000000 --output /tmp/practice
+
+      - name: Prepare exact source snapshots
+        run: |
+          git worktree add --detach /tmp/baseline 19320d2aa7028af363f977df9fd1de2c98906a8f
+          git worktree add --detach /tmp/trimmed 984bd04211fc3dbc723ffbbbc38252030daef23d
+
+      - name: Build three Docker images
+        run: |
+          docker build --platform linux/amd64 -t ss-baseline /tmp/baseline
+          docker build --platform linux/amd64 -t ss-trimmed /tmp/trimmed
+          docker build --platform linux/amd64 -t ss-bloom .
+
+      - name: Run alternating benchmarks on the same pinned CPUs
+        run: |
+          set -euo pipefail
+          run_one() {
+            label="$1"
+            image="$2"
+            out="/tmp/out-$label-$3"
+            rm -rf "$out"
+            mkdir -p "$out"
+            echo "===== BEGIN $label trial $3 ====="
+            /usr/bin/time -f "RESULT label=$label trial=$3 elapsed=%e max_rss_kb=%M" \
+              docker run --rm --cpuset-cpus=0-1 -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=2 \
+              -v /tmp/practice:/data:ro -v "$out":/output "$image"
+            echo "===== END $label trial $3 ====="
+          }
+          # Warm the same input pages, then alternate builds to reduce order bias.
+          run_one baseline ss-baseline 1
+          run_one trimmed ss-trimmed 1
+          run_one bloom ss-bloom 1
+          run_one bloom ss-bloom 2
+          run_one trimmed ss-trimmed 2
+          run_one baseline ss-baseline 2
+          {
+            echo "## 20M event A/B/A runtime comparison"
+            echo
+            echo "All six runs use the same generated dataset and CPUs 0-1, sequentially on one runner."
+            echo
+            echo "`base O2`: 19320d2aa7028af363f977df9fd1de2c98906a8f"
+            echo
+            echo "`trimmed radix + O3`: 984bd04211fc3dbc723ffbbbc38252030daef23d"
+            echo
+            echo "`trimmed radix + Bloom + O3`: 565fbaa77037a7076b1b142b1c18f8124e4b9953"
+          } >> "$GITHUB_STEP_SUMMARY"
