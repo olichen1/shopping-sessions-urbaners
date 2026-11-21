@@ -1,0 +1,72 @@
+name: Validate compact timestamp radix candidate
+
+on:
+  push:
+    branches:
+      - "optimise/time-offset-nobloom-v1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out candidate and history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download test assets and build the public dataset
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cargo rustc python3-pip unzip
+          mkdir -p /tmp/test-assets
+          curl -fL --retry 3 "https://github.com/olichen1/shopping-sessions-urbaners/releases/download/test-data-v1/generator.zip" -o /tmp/test-assets/generator.zip
+          curl -fL --retry 3 "https://github.com/olichen1/shopping-sessions-urbaners/releases/download/test-data-v1/dev-answer.zip" -o /tmp/test-assets/dev-answer.zip
+          unzip -q /tmp/test-assets/generator.zip -d /tmp/generator-src
+          unzip -q /tmp/test-assets/dev-answer.zip -d /tmp/expected
+          cargo build --release --manifest-path /tmp/generator-src/generator/Cargo.toml
+          /tmp/generator-src/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev
+          /tmp/generator-src/generator/target/release/generate --seed 1 --events 20000000 --clicks 5000000 --output /tmp/practice
+
+      - name: Build candidate image
+        run: docker build --platform linux/amd64 -t ss-time-offset .
+
+      - name: Check exact public dev outputs
+        run: |
+          mkdir -p /tmp/dev-output
+          docker run --rm --cpuset-cpus=0-1 -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=2 \
+            -v /tmp/dev:/data:ro -v /tmp/dev-output:/output ss-time-offset
+          python3 -m pip install --break-system-packages duckdb
+          python3 check.py /tmp/dev-output /tmp/expected/dev-answer
+
+      - name: Prepare prior revision images
+        run: |
+          git worktree add --detach /tmp/base 19320d2aa7028af363f977df9fd1de2c98906a8f
+          git worktree add --detach /tmp/trim 984bd04211fc3dbc723ffbbbc38252030daef23d
+          docker build --platform linux/amd64 -t ss-base /tmp/base
+          docker build --platform linux/amd64 -t ss-trim /tmp/trim
+
+      - name: Alternate all 20M benchmarks on the same runner
+        run: |
+          set -euo pipefail
+          run_one() {
+            label="$1"; image="$2"; trial="$3"
+            out="/tmp/out-$label-$trial"
+            rm -rf "$out"; mkdir -p "$out"
+            echo "===== BEGIN $label trial $trial ====="
+            /usr/bin/time -f "RESULT label=$label trial=$trial elapsed=%e max_rss_kb=%M" \
+              docker run --rm --cpuset-cpus=0-1 -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=2 \
+              -v /tmp/practice:/data:ro -v "$out":/output "$image"
+            echo "===== END $label trial $trial ====="
+          }
+          run_one base ss-base 1
+          run_one trim ss-trim 1
+          run_one offset ss-time-offset 1
+          run_one offset ss-time-offset 2
+          run_one trim ss-trim 2
+          run_one base ss-base 2
+          echo "Candidate commit: ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
