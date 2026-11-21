@@ -147,6 +147,21 @@ template <class F> static inline void for_lines(const char* b, const char* e, F 
 
 // CSV line with exactly n fields; each field is bare or wrapped in quotes as a whole.
 static inline bool parse_fields(const char* s, const char* e, int n, SV* out) {
+  if (n <= 0 || e < s) return false;
+  // Most generated rows are unquoted. Let libc's vectorized memchr scan
+  // those rows, falling back to the strict state machine whenever quotes occur.
+  if (!memchr(s, '"', (size_t)(e - s))) {
+    const char* p = s;
+    for (int k = 0; k < n - 1; ++k) {
+      const char* q = (const char*)memchr(p, ',', (size_t)(e - p));
+      if (!q) return false;
+      out[k] = {p, q};
+      p = q + 1;
+    }
+    if (memchr(p, ',', (size_t)(e - p))) return false;
+    out[n - 1] = {p, e};
+    return true;
+  }
   int k = 0;
   const char* p = s;
   for (;;) {
